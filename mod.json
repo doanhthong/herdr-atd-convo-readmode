@@ -1,0 +1,25 @@
+{
+  "place": "none",
+  "title": "Read Mode",
+  "overlay": {
+    "kind": "dialog",
+    "width": 0.82,
+    "height": 0.9
+  },
+  "palette": [
+    {
+      "label": "Read Mode: Conversation",
+      "about": "Read the focused agent's whole conversation in a proportional font",
+      "shared": {
+        "convo-reader.mode": "conversation"
+      }
+    },
+    {
+      "label": "Read Mode: Clipboard",
+      "about": "Read what you copied from the terminal as formatted text",
+      "shared": {
+        "convo-reader.mode": "clipboard"
+      }
+    }
+  ]
+}
