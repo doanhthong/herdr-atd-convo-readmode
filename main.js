@@ -22,6 +22,8 @@ const SIZES = [13, 14, 15, 16, 17, 18, 20, 22];
 const MEASURE_EM = 36;
 const LEADING = 1.6; // 120–145% is print's range; screens and dark backgrounds want a bit more
 const END_PAD = 48;
+const MEASURE_QUIET = 600; // ms a message's height must hold still before it's trusted
+const BOTTOM_HOLD = 1500; // ms after opening at the end during which late growth re-pins it
 const TOC_W = 240;
 const SERIFS = ["New York", "Charter", "Iowan Old Style", "Georgia"];
 // Herdr's UI font (Geist) ships as a single Regular face and bold isn't synthesized, so
@@ -67,10 +69,15 @@ export default class ReadMode extends View {
     const have = (() => { try { return new Set(fonts()); } catch { return new Set(); } })();
     this.serifFont = SERIFS.find((f) => have.has(f)) ?? null;
     this.sansFont = SANS.find((f) => have.has(f)) ?? null;
-    // The conversation opens at its end: each message is measured once (hidden), then a
-    // virtual list of those heights is scrolled to the bottom.
+    // The conversation opens at its end: each message is measured (hidden), then a virtual
+    // list of those heights is scrolled to the bottom. A message's first height can be
+    // short (long markdown and tables finish laying out a frame or more later), so the
+    // hidden copy stays mounted until its height has held still for MEASURE_QUIET ms.
     this.scroll = VirtualListScrollHandle.new();
     this.heights = new Map(); // measureKey → px
+    this.measuredAt = new Map(); // measureKey → when its height last changed
+    this.measureUntil = 0; // when the last hidden copy can go
+    this.bottomAt = 0; // when the list was last sent to the bottom
     this.bodyW = 0;
     this.wantBottom = true;
     // Where to put the list once it's laid out: { bottom: true } or { item: i }. A scroll
@@ -93,6 +100,9 @@ export default class ReadMode extends View {
       if (this.settle > 0) {
         this.applyPending();
         if (--this.settle === 0) this.pending = null;
+        cx.notify();
+      } else if (this.measureUntil && Date.now() > this.measureUntil) {
+        this.measureUntil = 0; // heights have settled: drop the hidden copies
         cx.notify();
       } else if (this.mode === "conversation" && this.toc && this.visStart !== this.tocAt) {
         cx.notify();
@@ -457,27 +467,48 @@ export default class ReadMode extends View {
       });
     const cover = () => div().absolute().inset_0().bg(t.background);
     if (!this.bodyW) return body;
+    const now = Date.now();
     const missing = items.filter((it) => !this.heights.has(this.measureKey(it)));
-    if (missing.length) {
-      // Lay the unmeasured messages out at the real width, under a cover.
-      return body
-        .child(v_flex().absolute().top(0).left(0).w(this.bodyW)
-          .children(missing.map((it) => {
-            const mk = this.measureKey(it);
-            return div().id(`rm-m-${mk}`).w_full().flex_none().child(this.item(t, it))
-              .on_size_change((s, cx) => {
-                // Nested sizes come back zoomed (app zoom), the body's don't: the width tells the scale.
-                this.heights.set(mk, s.width > 0 ? s.height * (this.bodyW / s.width) : s.height);
-                if (items.every((x) => this.heights.has(this.measureKey(x)))) cx.notify();
-              });
-          })))
-        .child(cover());
-    }
+    // Messages still being measured: never measured, or their height changed recently.
+    const measuring = items.filter((it) => {
+      const at = this.measuredAt.get(this.measureKey(it));
+      return at === undefined || now - at < MEASURE_QUIET;
+    });
+    // The hidden copies, laid out at the real width (visibility hidden: laid out, not painted).
+    const measurer = () => v_flex().absolute().top(0).left(0).w(this.bodyW).invisible()
+      .children(measuring.map((it) => {
+        const mk = this.measureKey(it);
+        return div().id(`rm-m-${mk}`).w_full().flex_none().child(this.item(t, it))
+          .on_size_change((s, cx) => {
+            // Nested sizes come back zoomed (app zoom), the body's don't: the width tells the scale.
+            const h = s.width > 0 ? s.height * (this.bodyW / s.width) : s.height;
+            const old = this.heights.get(mk);
+            if (old !== undefined && Math.abs(old - h) < 0.5) return;
+            this.heights.set(mk, h);
+            const at = Date.now();
+            this.measuredAt.set(mk, at);
+            this.measureUntil = Math.max(this.measureUntil, at + MEASURE_QUIET);
+            // A late change while the list sits at the end it was just sent to: send it again.
+            // Right after opening it stays covered; later it moves without a cover flash.
+            if (old !== undefined && at - this.bottomAt < BOTTOM_HOLD && (!this.pending || this.pending.bottom)) {
+              this.pending = { bottom: true, quiet: at - this.bottomAt > 300 };
+              this.settle = 0;
+            }
+            if (items.every((x) => this.heights.has(this.measureKey(x)))) cx.notify();
+          });
+      }));
+    if (missing.length) return body.child(measurer()).child(cover());
     const sizes = items.map((it) => this.heights.get(this.measureKey(it))).concat(END_PAD);
-    if (this.wantBottom) { this.wantBottom = false; this.pending = { bottom: true }; }
-    if (this.pending && this.settle === 0) { this.applyPending(); this.settle = 3; }
-    const covered = this.settle > 0 && this.pending?.bottom;
+    // A new request starts its own settle, rather than riding out the end of an older one.
+    if (this.wantBottom) { this.wantBottom = false; this.pending = { bottom: true }; this.settle = 0; }
+    if (this.pending && this.settle === 0) {
+      if (this.pending.bottom) this.bottomAt = now;
+      this.applyPending();
+      this.settle = 3;
+    }
+    const covered = this.settle > 0 && this.pending?.bottom && !this.pending.quiet;
     return body
+      .when(measuring.length > 0, (el) => el.child(measurer()))
       .child(v_virtual_list("rm-vlist", items.length + 1, sizes, (i) => (i < items.length ? items[i].key : "rm-end"),
         (range) => {
           this.visStart = Math.min(range.start, items.length - 1);
