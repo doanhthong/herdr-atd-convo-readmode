@@ -24,6 +24,9 @@ const LEADING = 1.6; // 120–145% is print's range; screens and dark background
 const END_PAD = 48;
 const TOC_W = 240;
 const SERIFS = ["New York", "Charter", "Iowan Old Style", "Georgia"];
+// Herdr's UI font (Geist) ships as a single Regular face and bold isn't synthesized, so
+// markdown **bold** would render regular. The sans body uses a system sans with real weights.
+const SANS = ["SF Pro Text", "SF Pro", "Inter", "Helvetica Neue"];
 
 // Mix two #rrggbb colors; anything else falls back to `a`.
 function mix(a, b, t) {
@@ -61,7 +64,9 @@ export default class ReadMode extends View {
     this.reflow = shared(K("reflow")) !== false;
     this.serif = shared(K("serif")) === true;
     this.toc = shared(K("toc")) !== false;
-    this.serifFont = (() => { try { const have = new Set(fonts()); return SERIFS.find((f) => have.has(f)) ?? null; } catch { return null; } })();
+    const have = (() => { try { return new Set(fonts()); } catch { return new Set(); } })();
+    this.serifFont = SERIFS.find((f) => have.has(f)) ?? null;
+    this.sansFont = SANS.find((f) => have.has(f)) ?? null;
     // The conversation opens at its end: each message is measured once (hidden), then a
     // virtual list of those heights is scrolled to the bottom.
     this.scroll = VirtualListScrollHandle.new();
@@ -351,7 +356,8 @@ export default class ReadMode extends View {
   }
 
   font(el) {
-    return this.serif && this.serifFont ? el.font_family(this.serifFont) : el;
+    const f = this.serif && this.serifFont ? this.serifFont : this.sansFont;
+    return f ? el.font_family(f) : el;
   }
 
   md(id, text, t) {
