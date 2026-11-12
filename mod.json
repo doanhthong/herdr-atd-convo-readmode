@@ -1,6 +1,7 @@
 {
   "place": "none",
   "title": "Read Mode",
+  "focusable": true,
   "overlay": {
     "kind": "dialog",
     "width": 0.82,

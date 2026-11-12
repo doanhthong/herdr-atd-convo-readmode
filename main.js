@@ -6,12 +6,15 @@
 // other programs fall back to the terminal's text. Clipboard: the clipboard's text,
 // cleaned of terminal wrapping (clean.js).
 //
+// Docked: the "readmode" block in the right sidebar (cmd-alt-m toggles it) follows the
+// focused terminal and re-reads when its agent finishes a turn.
+//
 // Keys: 1 conversation · 2 clipboard · o contents · t tools · w reflow · r reload
 //       c copy markdown · = / - text size · esc close
 
 import { View, div, list } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, TextView, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
-import { exec, appHome, theme, fonts, props, closeOverlay, focused, agents, panes, shared, setShared, notify, nextCommand } from "herdr";
+import { exec, appHome, theme, fonts, props, closeOverlay, focused, agents, panes, layout, run, shared, setShared, notify, nextCommand } from "herdr";
 import { terminalToMarkdown } from "./clean.js";
 
 const K = (k) => `convo-reader.${k}`;
@@ -25,6 +28,23 @@ const END_PAD = 48;
 const MEASURE_QUIET = 600; // ms a message's height must hold still before it's trusted
 const BOTTOM_HOLD = 1500; // ms after opening at the end during which late growth re-pins it
 const TOC_W = 240;
+// Docked: the layout block in the right sidebar (layouts/atd.json, id "readmode").
+const DOCK_ID = "readmode";
+const FOLLOW_MS = 700; // how often a docked copy checks which terminal to read
+const WIDE_HEADER = 900; // px a docked copy needs for the one-row header
+
+// A short fingerprint of a message, so a re-read that changes it is measured again.
+function hash(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+function findNode(node, id) {
+  if (node?.id === id) return node;
+  for (const c of node?.children ?? []) { const f = findNode(c, id); if (f) return f; }
+  return null;
+}
 const SERIFS = ["New York", "Charter", "Iowan Old Style", "Georgia"];
 // Herdr's UI font (Geist) ships as a single Regular face and bold isn't synthesized, so
 // markdown **bold** would render regular. The sans body uses a system sans with real weights.
@@ -60,12 +80,15 @@ function tocLabel(parts) {
 export default class ReadMode extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
+    // A layout block (the right sidebar) rather than a dialog: it stays open beside the
+    // terminals, follows the one you focus, and Esc hides the block instead of closing.
+    this.docked = !props()?.overlay && !!props()?.docked;
     this.mode = MODES.includes(shared(K("mode"))) ? shared(K("mode")) : "conversation";
     this.size = SIZES.includes(shared(K("size"))) ? shared(K("size")) : 16;
     this.tools = shared(K("tools")) !== false;
     this.reflow = shared(K("reflow")) !== false;
     this.serif = shared(K("serif")) === true;
-    this.toc = shared(K("toc")) !== false;
+    this.toc = this.docked ? shared(K("dock.toc")) === true : shared(K("toc")) !== false;
     const have = (() => { try { return new Set(fonts()); } catch { return new Set(); } })();
     this.serifFont = SERIFS.find((f) => have.has(f)) ?? null;
     this.sansFont = SANS.find((f) => have.has(f)) ?? null;
@@ -75,6 +98,8 @@ export default class ReadMode extends View {
     // hidden copy stays mounted until its height has held still for MEASURE_QUIET ms.
     this.scroll = VirtualListScrollHandle.new();
     this.heights = new Map(); // measureKey → px
+    this.lastH = new Map(); // item key → its last measured px, a stand-in while a changed message is measured
+    this.keepShown = false; // a quiet re-read: keep the list up (no cover) while measuring
     this.measuredAt = new Map(); // measureKey → when its height last changed
     this.measureUntil = 0; // when the last hidden copy can go
     this.bottomAt = 0; // when the list was last sent to the bottom
@@ -86,6 +111,7 @@ export default class ReadMode extends View {
     // is repeated on the next ticks, then the cover is lifted.
     this.pending = null;
     this.settle = 0;
+    this.visEnd = 0; // one past the last item the virtual list drew
     this.visStart = 0; // first item the virtual list drew; the contents highlights its turn
     this.tocAt = -1;
     this.target = this.pickTerminal();
@@ -95,7 +121,11 @@ export default class ReadMode extends View {
     this.rebuild();
     this.load(cx);
     this.readClip(cx);
-    cx.timer.after(50, () => this.handle.focus());
+    if (!this.docked) cx.timer.after(50, () => this.handle.focus());
+    if (this.docked) {
+      this.agentStatus = this.statusOf(this.target);
+      cx.timer.every(FOLLOW_MS, (cx) => this.follow(cx));
+    }
     cx.timer.every(30, (cx) => {
       if (this.settle > 0) {
         this.applyPending();
@@ -128,20 +158,86 @@ export default class ReadMode extends View {
     return inTab?.address ?? inTab?.terminal ?? agents().find((a) => a.focused)?.address ?? null;
   }
 
-  load(cx) {
+  statusOf(addr) {
+    return agents().find((a) => a.address === addr)?.status ?? null;
+  }
+
+  shown() {
+    const n = findNode(layout(), DOCK_ID);
+    return !!n && !n.hidden;
+  }
+
+  // Docked: read whichever terminal has focus now, and re-read when its agent finishes a turn.
+  // Reads happen in either tab, so the conversation is current when you switch back to it.
+  follow(cx) {
+    if (!this.shown()) { this.wasHidden = true; return; }
+    // Only a focused terminal or agent retargets: while the block itself has focus, keep reading
+    // the same terminal (pickTerminal's tab fallback could pick a different agent in the tab).
+    const f = focused();
+    const next = f?.terminal ?? f?.agent ?? null;
+    const status = this.statusOf(next ?? this.target);
+    const back = this.wasHidden;
+    this.wasHidden = false;
+    if (next && next !== this.target) {
+      this.target = next;
+      this.agentStatus = status;
+      this.resetView();
+      this.load(cx);
+      cx.notify();
+      return;
+    }
+    const finished = this.agentStatus === "working" && status !== "working";
+    this.agentStatus = status;
+    if (finished || back) this.load(cx, { quiet: true });
+  }
+
+  resetView() {
+    this.heights.clear();
+    this.measuredAt.clear();
+    this.lastH.clear();
+    this.wantBottom = true;
+    this.keepShown = false;
+    this.pending = null;
+    this.settle = 0;
+  }
+
+  load(cx, { quiet = false } = {}) {
     if (!this.target) { this.convo = { state: "error", text: "No terminal is focused." }; this.rebuild(); return; }
-    this.convo = { state: "loading" };
-    this.rebuild();
+    // A quiet re-read keeps the current text on screen until the new one is ready.
+    quiet = quiet && this.convo.state === "ready";
+    if (!quiet) {
+      this.keepShown = false;
+      this.convo = { state: "loading" };
+      this.rebuild();
+    }
+    const target = this.target;
+    const seq = (this.loadSeq = (this.loadSeq ?? 0) + 1);
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("python3", ["-I", `${appHome()}/mods/convo-reader/extract.py`, this.target]);
+        const r = await exec("python3", ["-I", `${appHome()}/mods/convo-reader/extract.py`, target]);
+        if (seq !== this.loadSeq) return; // a newer read (or focus moving on) superseded this one
         const d = JSON.parse(r.stdout || "null");
         if (!d) throw new Error(r.stderr.trim() || "no output");
-        this.convo = d.kind === "error" ? { state: "error", text: d.text } : { state: "ready", ...d };
+        const next = d.kind === "error" ? { state: "error", text: d.text } : { state: "ready", ...d };
+        if (quiet && JSON.stringify(next) === JSON.stringify(this.convo)) return;
+        this.convo = next;
       } catch (e) {
+        if (seq !== this.loadSeq) return;
+        if (quiet) return; // a failed background re-read keeps the conversation on screen
         this.convo = { state: "error", text: String(e?.message ?? e) };
       }
-      this.wantBottom = true;
+      // Only once the list has settled where it was sent (no scroll still pending): otherwise
+      // this would drop the opening cover and scroll.
+      if (quiet && this.mode === "conversation" && this.convo.state === "ready" && !this.wantBottom && !this.pending) {
+        // Stay where the reader is: follow the new turn only if they were already at the end
+        // (the end pad, item items.length, is drawn; range.end is exclusive).
+        const atEnd = this.visEnd > this.items.length;
+        this.keepShown = true; // no cover while the changed messages are measured
+        if (atEnd) this.wantBottom = "quiet";
+        else { this.pending = { item: this.visStart }; this.settle = 0; }
+      } else {
+        this.wantBottom = true;
+      }
       this.rebuild();
       cx.notify();
     });
@@ -244,6 +340,7 @@ export default class ReadMode extends View {
     if (mode === "clipboard") this.readClip(cx);
     this.mode = mode;
     if (mode === "conversation") this.wantBottom = true;
+    this.keepShown = false; // a different document: measure it under the cover
     setShared(K("mode"), mode);
     this.rebuild();
     cx.notify();
@@ -253,7 +350,7 @@ export default class ReadMode extends View {
     // Changing the column's width or the items' heights moves things: keep the turn in view.
     if (this.mode === "conversation" && ["toc", "tools", "serif"].includes(key) && !this.wantBottom) this.pending = { item: this.visStart };
     this[key] = !this[key];
-    setShared(K(key), this[key]);
+    setShared(K(this.docked && key === "toc" ? "dock.toc" : key), this[key]);
     this.rebuild();
     cx.notify();
   }
@@ -301,7 +398,9 @@ export default class ReadMode extends View {
   }
 
   close_() {
-    closeOverlay(props().overlay);
+    if (!this.docked) return closeOverlay(props().overlay);
+    run("layout.hide", { id: DOCK_ID });
+    if (this.target) run("pane.focus", { terminal: this.target });
   }
 
   onKey(e, cx) {
@@ -339,14 +438,27 @@ export default class ReadMode extends View {
     const sub = this.mode === "clipboard"
       ? `${this.clip.length.toLocaleString()} characters`
       : c.state === "ready" ? (c.kind === "transcript" ? `${this.agentName()} · ${this.turnCount ?? 0} turns · ${this.target}` : `terminal text · ${this.target}`) : this.target ?? "";
+    const titles = v_flex().min_w(0).flex_1()
+      .child(div().text_size(15).font_semibold().text_color(t.foreground).truncate().child(title))
+      .child(div().text_size(12).text_color(t.dim).truncate().child(sub));
+    const modes = h_flex().flex_none().gap(2).p(2).rounded(8).bg(t.surface).border(1).border_color(t.border)
+      .child(this.button(t, "rm-mode-convo", this.docked ? "Convo" : "Conversation", (cx) => this.setMode("conversation", cx), { active: this.mode === "conversation" }))
+      .child(this.button(t, "rm-mode-clip", "Clipboard", (cx) => this.setMode("clipboard", cx), { active: this.mode === "clipboard" }));
+    const tools = this.tools_(t, c);
+    // Narrow (the sidebar): title above the buttons. Wide (the sidebar dragged wide, the dialog): one row.
+    if (this.docked && this.rootW > 0 && this.rootW < WIDE_HEADER) {
+      return v_flex().px(12).pt(10).pb(8).gap(8).border_b(1).border_color(t.border).flex_none()
+        .child(h_flex().gap(8).items_center().child(titles).child(this.button(t, "rm-close", "✕", () => this.close_())))
+        .child(h_flex().gap(4).items_center().flex_wrap().child(modes).child(tools));
+    }
     return h_flex().px(16).h(52).gap(12).items_center().justify_between().border_b(1).border_color(t.border).flex_none()
-      .child(v_flex().min_w(0).flex_1()
-        .child(div().text_size(15).font_semibold().text_color(t.foreground).truncate().child(title))
-        .child(div().text_size(12).text_color(t.dim).truncate().child(sub)))
-      .child(h_flex().gap(2).p(2).rounded(8).bg(t.surface).border(1).border_color(t.border)
-        .child(this.button(t, "rm-mode-convo", "Conversation", (cx) => this.setMode("conversation", cx), { active: this.mode === "conversation" }))
-        .child(this.button(t, "rm-mode-clip", "Clipboard", (cx) => this.setMode("clipboard", cx), { active: this.mode === "clipboard" })))
-      .child(h_flex().gap(2).items_center()
+      .child(titles)
+      .child(modes)
+      .child(tools.child(this.button(t, "rm-close", "✕", () => this.close_())));
+  }
+
+  tools_(t, c) {
+    return h_flex().gap(2).items_center().flex_wrap()
         .when(this.mode === "conversation" && c.kind !== "screen", (el) => el
           .child(this.button(t, "rm-toc", "Contents", (cx) => this.toggle("toc", cx), { active: this.toc }))
           .child(this.button(t, "rm-tools", "Tools", (cx) => this.toggle("tools", cx), { active: this.tools })))
@@ -355,8 +467,7 @@ export default class ReadMode extends View {
         .child(this.button(t, "rm-smaller", "A−", (cx) => this.resize(-1, cx)))
         .child(this.button(t, "rm-bigger", "A+", (cx) => this.resize(1, cx)))
         .child(this.button(t, "rm-copy", "Copy", (cx) => this.copy(cx)))
-        .child(this.button(t, "rm-reload", "↻", (cx) => this.reload(cx)))
-        .child(this.button(t, "rm-close", "✕", () => this.close_())));
+        .child(this.button(t, "rm-reload", "↻", (cx) => this.reload(cx)));
   }
 
   // Body text: slightly softened from the theme's foreground on dark backgrounds, where
@@ -396,7 +507,7 @@ export default class ReadMode extends View {
 
   item(t, it) {
     const s = this.size;
-    const column = (el) => h_flex().w_full().justify_center().px(32).child(v_flex().w_full().max_w(Math.round(s * MEASURE_EM)).child(el));
+    const column = (el) => h_flex().w_full().justify_center().px(this.docked ? 18 : 32).child(v_flex().w_full().max_w(Math.round(s * MEASURE_EM)).child(el));
     if (it.kind === "empty") return column(div().pt(48).text_size(14).text_color(t.muted).child(it.text));
     if (it.kind === "doc") return column(v_flex().pt(Math.round(s * 2)).pb(Math.round(s)).gap(Math.round(s * 0.75))
       .when(!!it.note, (el) => el.child(div().text_size(12).text_color(t.dim).child(it.note)))
@@ -416,6 +527,13 @@ export default class ReadMode extends View {
     const t = theme();
     const items = this.items;
     return v_flex().id("rm-root").size_full().bg(t.background).text_color(t.foreground)
+      .on_size_change((s, cx) => {
+        if (Math.round(s.width) === Math.round(this.rootW ?? 0)) return;
+        this.rootW = s.width;
+        cx.notify();
+      })
+      .when(this.docked, (el) => el.rounded(10).border(1).border_color(t.border).overflow_hidden()
+        .on_mouse_down("left", () => this.handle.focus()))
       .track_focus(this.handle)
       .on_key_down((e, cx) => this.onKey(e, cx))
       .child(this.header(t))
@@ -428,7 +546,8 @@ export default class ReadMode extends View {
 
   // What a height depends on: the item, the column width, the text size and the tools view.
   measureKey(it) {
-    return `${it.key}-${Math.round(this.bodyW)}-${this.size}-${this.tools ? 1 : 0}-${this.serif ? 1 : 0}`;
+    it.sig ??= hash(JSON.stringify(it.parts ?? it.text ?? ""));
+    return `${it.key}-${it.sig}-${Math.round(this.bodyW)}-${this.size}-${this.tools ? 1 : 0}-${this.serif ? 1 : 0}`;
   }
 
   convoBody(t, items) {
@@ -485,33 +604,42 @@ export default class ReadMode extends View {
             const old = this.heights.get(mk);
             if (old !== undefined && Math.abs(old - h) < 0.5) return;
             this.heights.set(mk, h);
+            this.lastH.set(it.key, h);
             const at = Date.now();
             this.measuredAt.set(mk, at);
             this.measureUntil = Math.max(this.measureUntil, at + MEASURE_QUIET);
             // A late change while the list sits at the end it was just sent to: send it again.
             // Right after opening it stays covered; later it moves without a cover flash.
             if (old !== undefined && at - this.bottomAt < BOTTOM_HOLD && (!this.pending || this.pending.bottom)) {
-              this.pending = { bottom: true, quiet: at - this.bottomAt > 300 };
+              this.pending = { bottom: true, quiet: this.bottomQuiet || at - this.bottomAt > 300 };
               this.settle = 0;
             }
             if (items.every((x) => this.heights.has(this.measureKey(x)))) cx.notify();
           });
       }));
-    if (missing.length) return body.child(measurer()).child(cover());
-    const sizes = items.map((it) => this.heights.get(this.measureKey(it))).concat(END_PAD);
+    if (missing.length && !this.keepShown) return body.child(measurer()).child(cover());
+    if (!missing.length) this.keepShown = false;
+    // During a quiet re-read, changed messages stand in at their last height until measured.
+    const sizes = items.map((it) => this.heights.get(this.measureKey(it)) ?? this.lastH.get(it.key) ?? 0).concat(END_PAD);
     // A new request starts its own settle, rather than riding out the end of an older one.
-    if (this.wantBottom) { this.wantBottom = false; this.pending = { bottom: true }; this.settle = 0; }
-    if (this.pending && this.settle === 0) {
-      if (this.pending.bottom) this.bottomAt = now;
+    // Scroll requests wait until every height is real, or they'd land on the stand-ins.
+    if (this.wantBottom && !missing.length) {
+      this.pending = { bottom: true, quiet: this.wantBottom === "quiet" };
+      this.wantBottom = false;
+      this.settle = 0;
+    }
+    if (this.pending && this.settle === 0 && !missing.length) {
+      if (this.pending.bottom) { this.bottomAt = now; this.bottomQuiet = !!this.pending.quiet; }
       this.applyPending();
       this.settle = 3;
     }
     const covered = this.settle > 0 && this.pending?.bottom && !this.pending.quiet;
     return body
       .when(measuring.length > 0, (el) => el.child(measurer()))
-      .child(v_virtual_list("rm-vlist", items.length + 1, sizes, (i) => (i < items.length ? items[i].key : "rm-end"),
+      .child(v_virtual_list("rm-vlist", items.length + 1, sizes, (i) => (i < items.length ? `${items[i].key}-${items[i].sig}` : "rm-end"),
         (range) => {
           this.visStart = Math.min(range.start, items.length - 1);
+          this.visEnd = range.end;
           const out = [];
           for (let i = range.start; i < range.end; i++) out.push(i < items.length ? this.item(t, items[i]) : div().h(END_PAD));
           return out;

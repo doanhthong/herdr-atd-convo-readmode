@@ -9,6 +9,7 @@ A Herdr app mod for reading an agent conversation, or text you copied from a ter
 | How | What it opens |
 |---|---|
 | **Cmd+Shift+M** | Read Mode on the tab you used last, reading the terminal that had focus |
+| **Cmd+Alt+M** | Read Mode docked in a sidebar (needs a layout block, see [Docking it](#docking-it-optional)). It follows whichever terminal you focus and re-reads when that agent finishes a turn. Esc, `q` or ✕ hides it |
 | **Cmd+T** → type `read` → **Read Mode: Conversation** | The conversation tab |
 | **Cmd+T** → type `read` → **Read Mode: Clipboard** | The clipboard tab |
 
@@ -114,6 +115,30 @@ Then add the key to the `global` section of `~/.config/herdr-app/keys.json`:
 ```json
 "cmd-shift-m": "mod.open:convo-reader"
 ```
+
+### Docking it (optional)
+
+The Cmd+Alt+M sidebar needs a layout block that holds the mod, with `docked: true`. Add this to the `children` of an existing row in the layout you use (`~/.config/herdr-app/layouts/<name>.json`), next to the tab block:
+
+```json
+{
+  "id": "readmode",
+  "type": "block",
+  "hidden": true,
+  "size": { "px": 520 },
+  "min": 360,
+  "max": 1000,
+  "content": { "mod": "convo-reader", "props": { "docked": true } }
+}
+```
+
+Then bind a key to toggle it in the `global` section of `keys.json`:
+
+```json
+"cmd-alt-m": "layout.toggle:readmode"
+```
+
+The block's `id` must be `readmode`: ✕ and Esc hide the block by that id.
 
 Requirements: macOS (`pbpaste` / `pbcopy`), `python3` (the system one, 3.9+, is enough), and `hc` on `PATH`.
 
