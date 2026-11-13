@@ -101,16 +101,17 @@ They only reach Read Mode while it's open. To open it straight on the clipboard 
 
 ## Install
 
-The mod is this folder, linked into Herdr's mods folder:
+The mod is the `mods/convo-reader/` folder. Clone the repo and link that folder into Herdr's mods folder:
 
 ```sh
-ln -s ~/git-projects/herdr-atd-convo-readmode ~/.config/herdr-app/mods/convo-reader
+git clone https://github.com/doanhthong/herdr-atd-convo-readmode ~/git-projects/herdr-atd-convo-readmode
+ln -s ~/git-projects/herdr-atd-convo-readmode/mods/convo-reader ~/.config/herdr-app/mods/convo-reader
 herdr-app check ~/.config/herdr-app/mods/convo-reader
 ```
 
 The folder must be called `convo-reader` inside `mods/`: `main.js` finds `extract.py` at `mods/convo-reader/extract.py`.
 
-Then add the key to the `global` section of `~/.config/herdr-app/keys.json`:
+Then merge the keys in `keys.json` into the `global` section of `~/.config/herdr-app/keys.json`. The one that opens Read Mode is:
 
 ```json
 "cmd-shift-m": "mod.open:convo-reader"
@@ -162,10 +163,12 @@ cmd-shift-m ─► mod.open:convo-reader ─► main.js (dialog overlay)
 
 | File | Role |
 |---|---|
-| `main.js` | The overlay: header, tabs, buttons, keys, and drawing the messages |
-| `extract.py` | Terminal → conversation JSON (`{kind: "transcript", title, turns}` or `{kind: "screen", text}`) |
-| `clean.js` | Terminal text → markdown (unwrapping, tables, bullets, markers) |
-| `mod.json` | Overlay size (82% × 90% of the window) and the palette entries |
+| `mods/convo-reader/main.js` | The overlay: header, tabs, buttons, keys, and drawing the messages |
+| `mods/convo-reader/extract.py` | Terminal → conversation JSON (`{kind: "transcript", title, turns}` or `{kind: "screen", text}`) |
+| `mods/convo-reader/clean.js` | Terminal text → markdown (unwrapping, tables, bullets, markers) |
+| `mods/convo-reader/mod.json` | Overlay size (82% × 90% of the window) and the palette entries |
+| `keys.json` | The keys Read Mode expects (merge into yours) |
+| `RECIPE.md`, `preview.png` | The brief to rebuild the mod, and its gallery preview |
 | `docs/` | Screenshots for this README |
 
 `gpui-kit.d.ts` and `jsconfig.json` are written by Herdr on every start. Don't edit them.

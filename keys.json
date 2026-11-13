@@ -1,0 +1,6 @@
+{
+  "global": {
+    "cmd-shift-m": "mod.open:convo-reader",
+    "cmd-alt-m": "layout.toggle:readmode"
+  }
+}
